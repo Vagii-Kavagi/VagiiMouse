@@ -9,7 +9,7 @@ $bin = Join-Path $root 'bin'; $obj = Join-Path $root 'obj'
 New-Item -ItemType Directory -Force $bin, $obj | Out-Null
 $common = "/nologo /std:c++20 /EHsc /O2 /MT /W3 /permissive- /DUNICODE /D_UNICODE /utf-8 /wd4996"
 $rc = "rc /nologo /fo `"$obj\app.res`" `"$root\res\app.rc`""
-$link = "/link /SUBSYSTEM:WINDOWS `"$obj\app.res`" user32.lib gdi32.lib comctl32.lib shell32.lib advapi32.lib"
+$link = "/link /SUBSYSTEM:WINDOWS `"$obj\app.res`" user32.lib gdi32.lib comctl32.lib shell32.lib advapi32.lib d2d1.lib dwrite.lib dwmapi.lib winhttp.lib bcrypt.lib ole32.lib"
 $cmd = "$rc && cl $common `"$root\src\main.cpp`" /Fo`"$obj\\`" /Fe`"$bin\VagiiMouse.exe`" $link"
 $ErrorActionPreference = 'Continue'
 cmd /c "`"$vcvars`" >nul 2>&1 && $cmd 2>&1"

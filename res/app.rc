@@ -1,8 +1,9 @@
 #include <winuser.h>
+#include "../src/version.h"
 1 RT_MANIFEST "app.manifest"
 1 VERSIONINFO
-FILEVERSION 1,1,0,0
-PRODUCTVERSION 1,1,0,0
+FILEVERSION APP_VER_MAJOR,APP_VER_MINOR,APP_VER_PATCH,0
+PRODUCTVERSION APP_VER_MAJOR,APP_VER_MINOR,APP_VER_PATCH,0
 BEGIN
   BLOCK "StringFileInfo"
   BEGIN
@@ -10,8 +11,8 @@ BEGIN
     BEGIN
       VALUE "FileDescription", "Vagii Mouse"
       VALUE "ProductName", "Vagii Mouse"
-      VALUE "FileVersion", "1.1.0"
-      VALUE "ProductVersion", "1.1.0"
+      VALUE "FileVersion", APP_VER_STR
+      VALUE "ProductVersion", APP_VER_STR
     END
   END
   BLOCK "VarFileInfo"
