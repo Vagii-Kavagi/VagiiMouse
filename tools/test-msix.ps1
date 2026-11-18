@@ -1,15 +1,13 @@
-# Installs bin\VagiiMouse-*-dev.msix (unsigned, Windows 11), checks it runs from the package,
+# Registers the dev package layout (obj\msix, from store\build-msix.ps1; needs Developer Mode), checks it runs from the package,
 # checks HKCU/AppData writes reach the real registry/folder, then removes it and restarts the
 # normal install. Run from a real terminal (not a sandboxed shell).
 param([switch]$Keep)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
-$msix = Get-ChildItem (Join-Path $root 'bin') -Filter 'VagiiMouse-*-dev.msix' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-"package: $($msix.Name)"
 Get-Process VagiiMouse -ErrorAction SilentlyContinue | ForEach-Object { "stopping running copy: $($_.Path)"; $_ | Stop-Process -Force }
 Start-Sleep -Milliseconds 800
 # needs Developer Mode: unsigned packages with an exe are refused otherwise (0x80073D2B)
-Add-AppxPackage -Register (Join-Path $root "objmsixAppxManifest.xml")
+Add-AppxPackage -Register (Join-Path $root 'obj\msix\AppxManifest.xml')
 $pkg = Get-AppxPackage VagiiMouse.Dev
 "installed: $($pkg.PackageFullName)"
 "install dir: $($pkg.InstallLocation)"
