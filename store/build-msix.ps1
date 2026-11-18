@@ -1,21 +1,21 @@
 # Builds the Microsoft Store package (MSIX) of Vagii Mouse.
 #
-#   .\store\build-msix.ps1                 local test package (unsigned, installable with
-#                                          Add-AppxPackage -AllowUnsigned on Windows 11)
+#   .\store\build-msix.ps1                 local test package (registered by
+#                                          tools\test-msix.ps1; needs Developer Mode)
 #   .\store\build-msix.ps1 -Store -Name "<Package/Identity/Name>" -Publisher "<Package/Identity/Publisher>" -PublisherDisplayName "<your Store name>"
 #                                          upload package for Partner Center (values from
 #                                          Product management > Product identity)
 param(
   [switch]$Store,
   [string]$Name = "VagiiMouse.Dev",
-  # the OID marks a package as intentionally unsigned (Windows 11 local installs only)
-  [string]$Publisher = "CN=VagiiDev, OID.2.25.311729368913984317654407730594956997722=1",
+  # dev identity for Developer Mode registration (tools\test-msix.ps1)
+  [string]$Publisher = "CN=VagiiDev",
   [string]$PublisherDisplayName = "Vagii",
   [switch]$NoBuild
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
-if ($Store -and ($Name -eq "VagiiMouse.Dev" -or $Publisher -like "*OID.2.25.311729368913984317654407730594956997722*")) {
+if ($Store -and ($Name -eq "VagiiMouse.Dev" -or $Publisher -eq "CN=VagiiDev")) {
   throw "-Store needs the Name and Publisher from Partner Center (Product identity page)."
 }
 if (-not $NoBuild) { & (Join-Path $root 'build.ps1') }
