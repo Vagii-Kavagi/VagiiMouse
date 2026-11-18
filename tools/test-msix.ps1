@@ -8,7 +8,8 @@ $msix = Get-ChildItem (Join-Path $root 'bin') -Filter 'VagiiMouse-*-dev.msix' | 
 "package: $($msix.Name)"
 Get-Process VagiiMouse -ErrorAction SilentlyContinue | ForEach-Object { "stopping running copy: $($_.Path)"; $_ | Stop-Process -Force }
 Start-Sleep -Milliseconds 800
-Add-AppxPackage -Path $msix.FullName -AllowUnsigned -ForceUpdateFromAnyVersion
+# needs Developer Mode: unsigned packages with an exe are refused otherwise (0x80073D2B)
+Add-AppxPackage -Register (Join-Path $root "objmsixAppxManifest.xml")
 $pkg = Get-AppxPackage VagiiMouse.Dev
 "installed: $($pkg.PackageFullName)"
 "install dir: $($pkg.InstallLocation)"
