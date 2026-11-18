@@ -24,6 +24,11 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <thread>
+#include <appmodel.h>
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.ApplicationModel.h>
+#include <winrt/Windows.ApplicationModel.Activation.h>
 #include "version.h"
 
 template <class T> static void SafeRelease(T*& p) { if (p) { p->Release(); p = nullptr; } }
@@ -57,6 +62,21 @@ struct Settings {
 
 static wchar_t g_ini[MAX_PATH];
 static bool g_test = false;  // VAGII_TEST=1: screenshot instance, own data, changes nothing on the system
+// Microsoft Store (MSIX) install: the Store does updates and "Start with Windows" is a package
+// StartupTask instead of the HKCU Run key. VAGII_FAKE_STORE=1 previews this mode unpackaged.
+static bool g_packaged = false, g_fakeStore = false;
+static bool IsPackaged() {
+    UINT32 n = 0;
+    return GetCurrentPackageFullName(&n, nullptr) == ERROR_INSUFFICIENT_BUFFER;
+}
+static bool StoreMode() { return g_packaged || g_fakeStore; }
+// Started by the package's StartupTask at sign-in (stay in the tray, like --tray).
+static bool LaunchedByStartupTask() {
+    try {
+        auto a = winrt::Windows::ApplicationModel::AppInstance::GetActivatedEventArgs();
+        return a && a.Kind() == winrt::Windows::ApplicationModel::Activation::ActivationKind::StartupTask;
+    } catch (...) { return false; }
+}
 
 static std::wstring DataDir() {
     wchar_t base[MAX_PATH];
@@ -338,8 +358,25 @@ static void CaptureOriginal() {
     }
 }
 
+#define WM_STARTUP_STATE (WM_APP + 4)
 static void SetStartup(bool on) {
-    if (g_test) return;
+    if (g_test || g_fakeStore) return;
+    if (g_packaged) {
+        // StartupTask (declared in AppxManifest.xml). Off thread: its async calls must not block the UI.
+        std::thread([on] {
+            bool enabled = false;
+            try {
+                winrt::init_apartment(winrt::apartment_type::multi_threaded);
+                using namespace winrt::Windows::ApplicationModel;
+                StartupTask t = StartupTask::GetAsync(L"VagiiMouseStartup").get();
+                if (on) enabled = t.RequestEnableAsync().get() == StartupTaskState::Enabled;
+                else t.Disable();
+            } catch (...) {}
+            // the user may have turned it off in Task Manager; show the real state
+            if (on && !enabled && g_hwnd) PostMessageW(g_hwnd, WM_STARTUP_STATE, 0, 0);
+        }).detach();
+        return;
+    }
     HKEY k;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_SET_VALUE, &k) != ERROR_SUCCESS) return;
     if (on) {
@@ -1234,9 +1271,10 @@ static void DrawSettingsPage() {
         {L"Keep running when closed", L"Closing the window hides it to the tray", &S.closeToTray},
         {L"Check for updates automatically", L"Looks on GitHub a few times a day", &S.autoUpdate},
     };
-    RF box = R(X, 168, CW, 4 * 62.f);
+    const int nRows = StoreMode() ? 3 : 4;  // the Store handles updates
+    RF box = R(X, 168, CW, nRows * 62.f);
     Fill(box, 14, C_CARD);
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < nRows; i++) {
         float y = box.top + i * 62;
         if (i) g_rt->DrawLine(D2D1::Point2F(box.left + 18, y), D2D1::Point2F(box.right - 18, y), B(C_CARD2), 1);
         Txt(rows[i].t, R(box.left + 18, y + 12, 260, 20), fBodyB, C_TEXT);
@@ -1251,7 +1289,7 @@ static void DrawSettingsPage() {
     }
 
     {
-        RF r = R(X, 428, CW, 76);
+        RF r = R(X, 168 + nRows * 62.f + 12, CW, 76);
         Fill(r, 14, C_CARD);
         Txt(L"Windows mouse registry", R(r.left + 18, r.top + 14, 200, 20), fBodyB, C_TEXT);
         Txt(g_regMsg.empty() ? L"Control Panel\\Mouse to defaults" : g_regMsg, R(r.left + 18, r.top + 36, 214, 30),
@@ -1266,6 +1304,14 @@ static void DrawSettingsPage() {
         Fill(r, 14, C_CARD);
         Txt(L"UPDATES", R(r.left + 18, r.top + 14, 200, 16), fLabel, C_DIM);
         Txt(L"Vagii Mouse " APP_VER_WSTR, R(r.left + 18, r.top + 36, 300, 24), fBodyB, C_TEXT);
+        if (StoreMode()) {
+            fSmall->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+            Txt(L"Installed from the Microsoft Store, which keeps Vagii Mouse up to date automatically.",
+                R(r.left + 18, r.top + 62, RW - 36, 62), fSmall, C_DIM, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+            fSmall->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+            if (Button(325, R(r.left + 18, r.top + 150, RW - 36, 40), L"Open Store updates", C_MOUSE, C_WHITE, IC_REFRESH))
+                ShellExecuteW(nullptr, L"open", L"ms-windows-store://downloadsandupdates", nullptr, nullptr, SW_SHOWNORMAL);
+        } else {
         int st = U.state.load();
         std::wstring latest, err;
         { std::lock_guard<std::mutex> g(U.mx); latest = U.latest; err = U.error; }
@@ -1307,6 +1353,7 @@ static void DrawSettingsPage() {
         } else {
             if (Button(323, br, L"Check for updates", C_MOUSE, C_WHITE, IC_REFRESH)) StartCheck(false);
         }
+        }  // !StoreMode()
     }
     {
         RF r = R(RX, 312, RW, 104);
@@ -1427,7 +1474,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         }
         TrayAdd();
         SetTimer(h, TIMER_STATUS, 150, nullptr);
-        if (!g_test && S.autoUpdate) SetTimer(h, TIMER_AUTOCHECK, 8000, nullptr);
+        if (!g_test && !StoreMode() && S.autoUpdate) SetTimer(h, TIMER_AUTOCHECK, 8000, nullptr);
         return 0;
     }
     case WM_DPICHANGED: {
@@ -1524,6 +1571,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
     case WM_SHOWME: ShowMain(); return 0;
+    case WM_STARTUP_STATE: S.startup = 0; SaveSettings(); Redraw(); return 0;
     case WM_ERASEBKGND: return 1;
     case WM_PAINT: {
         PAINTSTRUCT ps;
@@ -1568,6 +1616,8 @@ static void DarkMenus() {
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmd, int) {
     wchar_t ev[8] = L"";
     g_test = GetEnvironmentVariableW(L"VAGII_TEST", ev, 8) && ev[0] == L'1';
+    g_packaged = IsPackaged();
+    g_fakeStore = !g_packaged && GetEnvironmentVariableW(L"VAGII_FAKE_STORE", ev, 8) && ev[0] == L'1';
     const wchar_t* cls = g_test ? L"VagiiMouseWndTest" : L"VagiiMouseWnd";
     // Started by the updater: wait for the previous version to exit before taking over.
     if (const wchar_t* wp = wcsstr(cmd, L"--wait-pid=")) {
@@ -1587,6 +1637,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmd, int) {
 
     QueryPerformanceFrequency(&g_qpf);
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (g_packaged && LaunchedByStartupTask()) startHidden = true;
+    if (StoreMode()) S.startup = 0;  // Store installs start with Windows only once the user turns it on
     IniPath();
     ProbePad();
     LoadSettings();
@@ -1595,7 +1647,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmd, int) {
     if (us && g_test) { U.state = _wtoi(us + 6); U.latest = L"v1.3.0"; U.progress = 420; U.error = L"Couldn't reach GitHub. Check your connection and try again."; }
     SaveSettings();
     DarkMenus();
-    if (!g_test) PostUpdateCleanup();
+    if (!g_test && !StoreMode()) PostUpdateCleanup();
     if (wcsstr(cmd, L"--updated")) { S.page = PAGE_SETTINGS; U.state = U_UPTODATE; g_justUpdated = true; }
 
     if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &g_d2d)) ||
@@ -1645,7 +1697,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmd, int) {
     HWND hwnd = CreateWindowExW(0, cls, L"Vagii Mouse", style, x, y, w, hgt, nullptr, nullptr, inst, nullptr);
     FitOnScreen(hwnd);
     if (!startHidden) ShowWindow(hwnd, SW_SHOWNORMAL);
-    if (wcsstr(cmd, L"--update-now")) { g_updateNow = true; S.page = PAGE_SETTINGS; StartCheck(false); }
+    if (!StoreMode() && wcsstr(cmd, L"--update-now")) { g_updateNow = true; S.page = PAGE_SETTINGS; StartCheck(false); }
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
