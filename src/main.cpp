@@ -965,8 +965,13 @@ static void DrawDevicePage(int dev) {
     const float A0 = 135, SWEEP = 270;
     {
         RF hit = R(cx - rad - 22, cy - rad - 22, (rad + 22) * 2, (rad + 22) * 2);
-        bool hov;
-        Click(200, hit, &hov);
+        // Only the ring itself grabs the dial; the number and the -/+ buttons inside it don't.
+        float pdx = ui.mx - cx, pdy = ui.my - cy;
+        RF minusR = R(cx - 52, cy + 70, 34, 34), plusR = R(cx + 18, cy + 70, 34, 34);
+        bool onRing = Over(hit) && !Over(minusR) && !Over(plusR) && fabsf(sqrtf(pdx * pdx + pdy * pdy) - rad) <= 20;
+        bool hov = onRing;
+        if (onRing) ui.newHot = 200;
+        if (onRing && ui.pressed) ui.active = 200;
         if (ui.active == 200 && ui.down) {
             float dx = ui.mx - cx, dy = ui.my - cy;
             if (dx * dx + dy * dy > 16 * 16) {
@@ -978,7 +983,7 @@ static void DrawDevicePage(int dev) {
                 SetLevel(dev, 1 + (int)lroundf(rel / SWEEP * (MAX_LEVEL - 1)));
             }
         }
-        if (hov && ui.wheel) SetLevel(dev, d.level + (ui.wheel > 0 ? 1 : -1));
+        if (Over(hit) && ui.wheel) SetLevel(dev, d.level + (ui.wheel > 0 ? 1 : -1));
         Arc(cx, cy, rad, A0, A0 + SWEEP, C_CARD2, 14);
         // Windows range marker (1..20) in a dimmer tone under the fill
         float winEnd = A0 + SWEEP * (WIN_MAX - 1) / float(MAX_LEVEL - 1);
