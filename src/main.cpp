@@ -535,6 +535,16 @@ static std::string Sha256Hex(const std::string& data) {
     return s;
 }
 
+static std::wstring ExePath() {
+    wchar_t p[MAX_PATH];
+    GetModuleFileNameW(nullptr, p, MAX_PATH);
+    return p;
+}
+static std::wstring ExeSibling(const wchar_t* name) {
+    std::wstring p = ExePath();
+    return p.substr(0, p.find_last_of(L'\\') + 1) + name;
+}
+
 static void SetUpd(int st, const std::wstring& err = L"") {
     { std::lock_guard<std::mutex> g(U.mx); if (!err.empty()) U.error = err; }
     U.state = st;
@@ -557,7 +567,9 @@ static DWORD WINAPI CheckThread(LPVOID p) {
         size_t at = 0;
         std::string name = JsonStr(body, pos, "name", &at);
         if (name.empty()) break;
-        if (name == "VagiiMouse-Setup.exe") {
+        // The plain app exe: updating swaps it in place, so no installer has to run (Smart App Control
+        // blocks unsigned installers launched by another app).
+        if (name == "VagiiMouse.exe") {
             size_t urlAt = 0;
             url = JsonStr(body, at, "browser_download_url", &urlAt);
             digest = JsonStr(body, at, "digest", nullptr, urlAt);
@@ -598,16 +610,13 @@ static DWORD WINAPI DownloadThread(LPVOID) {
             return 0;
         }
     }
-    wchar_t tmp[MAX_PATH];
-    GetTempPathW(MAX_PATH, tmp);
-    std::wstring dir = std::wstring(tmp) + L"VagiiMouseUpdate";
-    CreateDirectoryW(dir.c_str(), nullptr);
-    std::wstring file = dir + L"\\VagiiMouse-Setup-" + tag + L".exe";
+    // Saved next to the running exe so the swap is a rename on the same drive.
+    std::wstring file = ExeSibling(L"VagiiMouse.new.exe");
     HANDLE f = CreateFileW(file.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     DWORD wr = 0;
     bool ok = f != INVALID_HANDLE_VALUE && WriteFile(f, data.data(), (DWORD)data.size(), &wr, nullptr) && wr == data.size();
     if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
-    if (!ok) { SetUpd(U_ERROR, L"Couldn't save the update."); U.busy = false; return 0; }
+    if (!ok) { DeleteFileW(file.c_str()); SetUpd(U_ERROR, L"Couldn't save the update next to the app (folder not writable)."); U.busy = false; return 0; }
     { std::lock_guard<std::mutex> g(U.mx); U.file = file; }
     SetUpd(U_READY);
     U.busy = false;
@@ -712,6 +721,8 @@ struct UIState {
 } ui;
 static int g_menuStage = -1;  // deferred right-click menu on a stage pill
 static bool g_updateNow = false;  // --update-now
+static bool g_justUpdated = false;
+static bool g_pendingInstall = false;  // "Install now" clicked; run after painting finishes
 static bool g_pendingRegReset = false;  // deferred confirmation dialog
 static std::wstring g_regMsg;
 static bool g_regOk = false;
@@ -802,14 +813,78 @@ static void ShowMain() {
     UpdateHook();
 }
 
+static bool g_updBlocked = false;  // last install attempt was stopped by Windows app control
+#define RELEASES_URL L"https://github.com/" APP_REPO L"/releases/latest"
+
+// Swap the running exe for the downloaded one: rename ours to .old (allowed while running),
+// move the new one into place and start it. The new copy waits for us to exit before it
+// takes over. If Windows refuses to start it (e.g. Smart App Control), put everything back.
 static void InstallUpdate() {
-    std::wstring file;
-    { std::lock_guard<std::mutex> g(U.mx); file = U.file; }
+    std::wstring file, tag;
+    { std::lock_guard<std::mutex> g(U.mx); file = U.file; tag = U.latest; }
     if (file.empty() || g_test) return;
-    // The installer closes nothing of ours (we exit first) and restarts Vagii Mouse when done.
-    HINSTANCE r = ShellExecuteW(nullptr, L"open", file.c_str(), L"/SILENT /SUPPRESSMSGBOXES /NORESTART", nullptr, SW_SHOWNORMAL);
-    if ((INT_PTR)r > 32) DestroyWindow(g_hwnd);
-    else SetUpd(U_ERROR, L"Windows didn't start the installer.");
+    std::wstring cur = ExePath(), old = ExeSibling(L"VagiiMouse.old.exe");
+    g_updBlocked = false;
+    DeleteFileW(old.c_str());
+    if (!MoveFileExW(cur.c_str(), old.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        SetUpd(U_ERROR, L"Couldn't replace the app file (error " + std::to_wstring(GetLastError()) + L").");
+        return;
+    }
+    if (!MoveFileExW(file.c_str(), cur.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        DWORD e = GetLastError();
+        MoveFileExW(old.c_str(), cur.c_str(), MOVEFILE_REPLACE_EXISTING);
+        SetUpd(U_ERROR, L"Couldn't put the new version in place (error " + std::to_wstring(e) + L").");
+        return;
+    }
+    std::wstring cmd = L"\"" + cur + L"\" --updated --wait-pid=" + std::to_wstring(GetCurrentProcessId());
+    STARTUPINFOW si{sizeof(si)};
+    PROCESS_INFORMATION pi{};
+    wchar_t fake[4] = L"";  // VAGII_FAKE_BLOCK=1 simulates Smart App Control refusing the new exe (testing)
+    bool fakeBlock = GetEnvironmentVariableW(L"VAGII_FAKE_BLOCK", fake, 4) && fake[0] == L'1';
+    if (!fakeBlock && CreateProcessW(cur.c_str(), cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        DestroyWindow(g_hwnd);  // the new version takes over once we're gone
+        return;
+    }
+    DWORD e = fakeBlock ? 4551 : GetLastError();
+    // Roll back: the new file goes away, the old one comes back.
+    MoveFileExW(cur.c_str(), file.c_str(), MOVEFILE_REPLACE_EXISTING);
+    MoveFileExW(old.c_str(), cur.c_str(), MOVEFILE_REPLACE_EXISTING);
+    DeleteFileW(file.c_str());
+    { std::lock_guard<std::mutex> g(U.mx); U.file.clear(); }
+    if (e >= 4550 && e <= 4599) {
+        g_updBlocked = true;
+        SetUpd(U_ERROR, L"Windows Smart App Control blocked " + tag + L" because it isn't signed yet. You're still on " APP_VER_WSTR
+                        L" and nothing changed. Get the new version from the download page instead.");
+    } else {
+        SetUpd(U_ERROR, L"Windows didn't start the new version (error " + std::to_wstring(e) + L"). You're still on " APP_VER_WSTR L".");
+    }
+}
+
+// After an update: remove leftovers and keep the installer's "Apps" entry on the right version.
+static void PostUpdateCleanup() {
+    for (int i = 0; i < 20 && !DeleteFileW(ExeSibling(L"VagiiMouse.old.exe").c_str()) && GetLastError() != ERROR_FILE_NOT_FOUND; i++) Sleep(250);
+    DeleteFileW(ExeSibling(L"VagiiMouse.new.exe").c_str());
+    wchar_t tmp[MAX_PATH];
+    GetTempPathW(MAX_PATH, tmp);
+    std::wstring dir = std::wstring(tmp) + L"VagiiMouseUpdate";
+    WIN32_FIND_DATAW fd;
+    HANDLE fh = FindFirstFileW((dir + L"\\*.exe").c_str(), &fd);
+    if (fh != INVALID_HANDLE_VALUE) {
+        do DeleteFileW((dir + L"\\" + fd.cFileName).c_str()); while (FindNextFileW(fh, &fd));
+        FindClose(fh);
+    }
+    RemoveDirectoryW(dir.c_str());
+    HKEY k;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{8C3F1B27-6A94-4E5D-A0B8-2F7D91C4E6A3}_is1",
+                      0, KEY_QUERY_VALUE | KEY_SET_VALUE, &k) == ERROR_SUCCESS) {
+        const wchar_t* v = APP_VER_WSTR;
+        RegSetValueExW(k, L"DisplayVersion", 0, REG_SZ, (const BYTE*)v, DWORD((wcslen(v) + 1) * sizeof(wchar_t)));
+        std::wstring name = L"Vagii Mouse " APP_VER_WSTR;
+        RegSetValueExW(k, L"DisplayName", 0, REG_SZ, (const BYTE*)name.c_str(), DWORD((name.size() + 1) * sizeof(wchar_t)));
+        RegCloseKey(k);
+    }
 }
 
 // ================================================================ widgets
@@ -1199,13 +1274,13 @@ static void DrawSettingsPage() {
         switch (st) {
         case U_IDLE: msg = S.lastCheck ? L"Not checked since the app started." : L"Never checked yet."; break;
         case U_CHECKING: msg = L"Checking GitHub\x2026"; break;
-        case U_UPTODATE: msg = L"You're on the latest version."; mc = C_LIVE; break;
+        case U_UPTODATE: msg = g_justUpdated ? L"Updated to " APP_VER_WSTR L". You're on the latest version." : L"You're on the latest version."; mc = C_LIVE; break;
         case U_AVAILABLE: msg = L"Version " + latest + L" is available."; mc = C_LIVE; break;
         case U_DOWNLOADING: msg = L"Downloading " + latest + L"\x2026"; break;
         case U_READY: msg = L"Downloaded and checked. Install restarts Vagii Mouse."; mc = C_LIVE; break;
         case U_ERROR: msg = err; mc = C_DANGER; break;
         }
-        RF mr = R(r.left + 18, r.top + 62, RW - 36, 40);
+        RF mr = R(r.left + 18, r.top + 62, RW - 36, 62);
         fSmall->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
         Txt(msg, mr, fSmall, mc, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
         fSmall->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
@@ -1214,7 +1289,7 @@ static void DrawSettingsPage() {
             tm lt; localtime_s(&lt, &t);
             wchar_t tb[64];
             wcsftime(tb, 64, L"Last checked %d %b, %H:%M", &lt);
-            Txt(tb, R(r.left + 18, r.top + 108, RW - 36, 16), fSmall, C_FAINT);
+            Txt(tb, R(r.left + 18, r.top + 126, RW - 36, 16), fSmall, C_FAINT);
         }
         RF br = R(r.left + 18, r.top + 150, RW - 36, 40);
         if (st == U_DOWNLOADING) {
@@ -1223,7 +1298,10 @@ static void DrawSettingsPage() {
         } else if (st == U_AVAILABLE) {
             if (Button(320, br, L"Download and install " + latest, C_LIVE, 0x052E16, IC_DOWNLOAD)) StartDownload();
         } else if (st == U_READY) {
-            if (Button(321, br, L"Install now", C_LIVE, 0x052E16, IC_CHECK)) InstallUpdate();
+            if (Button(321, br, L"Install now", C_LIVE, 0x052E16, IC_CHECK)) g_pendingInstall = true;  // after EndDraw
+        } else if (st == U_ERROR && g_updBlocked) {
+            if (Button(324, br, L"Open download page", C_MOUSE, C_WHITE, IC_DOWNLOAD))
+                ShellExecuteW(nullptr, L"open", RELEASES_URL, nullptr, nullptr, SW_SHOWNORMAL);
         } else if (st == U_CHECKING) {
             Button(322, br, L"Checking\x2026", C_CARD2, C_DIM);
         } else {
@@ -1454,6 +1532,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         EndPaint(h, &ps);
         if (g_menuStage >= 0) { int i = g_menuStage; g_menuStage = -1; StageMenu(i); }
         if (g_pendingRegReset) { g_pendingRegReset = false; RegResetFlow(); }
+        if (g_pendingInstall) { g_pendingInstall = false; InstallUpdate(); }
         return 0;
     }
     case WM_SHOWWINDOW:
@@ -1490,6 +1569,13 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmd, int) {
     wchar_t ev[8] = L"";
     g_test = GetEnvironmentVariableW(L"VAGII_TEST", ev, 8) && ev[0] == L'1';
     const wchar_t* cls = g_test ? L"VagiiMouseWndTest" : L"VagiiMouseWnd";
+    // Started by the updater: wait for the previous version to exit before taking over.
+    if (const wchar_t* wp = wcsstr(cmd, L"--wait-pid=")) {
+        if (HANDLE old = OpenProcess(SYNCHRONIZE, FALSE, (DWORD)_wtoi(wp + 11))) {
+            WaitForSingleObject(old, 15000);
+            CloseHandle(old);
+        }
+    }
     HANDLE mtx = CreateMutexW(nullptr, TRUE, g_test ? L"Local\\VagiiMouseTest" : L"Local\\VagiiMouseSingleInstance");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         if (HWND other = FindWindowW(cls, nullptr)) PostMessageW(other, WM_SHOWME, 0, 0);
@@ -1509,6 +1595,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmd, int) {
     if (us && g_test) { U.state = _wtoi(us + 6); U.latest = L"v1.3.0"; U.progress = 420; U.error = L"Couldn't reach GitHub. Check your connection and try again."; }
     SaveSettings();
     DarkMenus();
+    if (!g_test) PostUpdateCleanup();
+    if (wcsstr(cmd, L"--updated")) { S.page = PAGE_SETTINGS; U.state = U_UPTODATE; g_justUpdated = true; }
 
     if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &g_d2d)) ||
         FAILED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), (IUnknown**)&g_dw)) || !CreateTextFormats()) {

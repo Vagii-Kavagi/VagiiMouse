@@ -1,7 +1,7 @@
 ; VagiiMouse-Setup.exe - pointer speed booster, single exe, per-user (no admin).
 ; Build: build-installer.ps1 (Src defaults to the folder above this script)
 #define AppName "Vagii Mouse"
-#define AppVer "1.2.1"
+#define AppVer "1.2.2"
 #ifndef Src
   #define Src AddBackslash(SourcePath) + ".."
 #endif
