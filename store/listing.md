@@ -43,5 +43,5 @@ mouse speed, pointer speed, DPI, mouse acceleration, trackpad speed, touchpad, s
 - Category: Utilities & tools
 - Privacy policy URL: https://github.com/Vagii-Kavagi/VagiiMouse/blob/main/PRIVACY.md
 - Website: https://github.com/Vagii-Kavagi/VagiiMouse
-- Support contact: https://github.com/Vagii-Kavagi/VagiiMouse/issues
+- Support contact: an email address or a non-GitHub website (Microsoft rejects GitHub links here)
 - Copyright: © 2026 vagii

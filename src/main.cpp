@@ -443,6 +443,7 @@ static bool BackupMouseKey(std::wstring& path) {
     return ok;
 }
 
+static void ApplyMouseDefaultsLive();
 static bool ResetMouseRegistry() {
     HKEY k;
     if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Control Panel\\Mouse", 0, nullptr, 0, KEY_SET_VALUE, nullptr, &k, nullptr) != ERROR_SUCCESS) return false;
@@ -452,7 +453,11 @@ static bool ResetMouseRegistry() {
     ok &= RegSetValueExW(k, L"SmoothMouseXCurve", 0, REG_BINARY, kCurveX, sizeof(kCurveX)) == ERROR_SUCCESS;
     ok &= RegSetValueExW(k, L"SmoothMouseYCurve", 0, REG_BINARY, kCurveY, sizeof(kCurveY)) == ERROR_SUCCESS;
     RegCloseKey(k);
-    // Apply what Windows can apply live (the acceleration curves need a sign-out).
+    ApplyMouseDefaultsLive();
+    return ok;
+}
+// Apply what Windows can apply live (the acceleration curves need a sign-out).
+static void ApplyMouseDefaultsLive() {
     const UINT fl = SPIF_UPDATEINIFILE | SPIF_SENDCHANGE;
     int acc[3] = {6, 10, 1};
     SystemParametersInfoW(SPI_SETMOUSE, 0, acc, fl);
@@ -467,7 +472,6 @@ static bool ResetMouseRegistry() {
     SystemParametersInfoW(SPI_SETSNAPTODEFBUTTON, FALSE, nullptr, fl);
     SystemParametersInfoW(SPI_SETACTIVEWINDOWTRACKING, 0, (PVOID)FALSE, fl);
     SystemParametersInfoW(SPI_SETMOUSEBUTTONSWAP, FALSE, nullptr, fl);
-    return ok;
 }
 
 // ================================================================ updater (GitHub releases)
@@ -1425,6 +1429,73 @@ static void StageMenu(int idx) {
     Redraw();
 }
 
+// Store installs: Windows redirects a packaged app's own HKCU writes to a private copy that
+// Windows never reads (verified with tools\probe-msix.ps1), so there the reset is done by
+// Windows' own reg.exe started outside the package. Desktop-app breakaway policy: a process
+// created with BREAKAWAY_ENABLE_PROCESS_TREE still runs in the package, but its children
+// (that aren't part of the package) run outside it, hence cmd.exe -> reg.exe.
+#ifndef PROC_THREAD_ATTRIBUTE_DESKTOP_APP_POLICY
+#define PROC_THREAD_ATTRIBUTE_DESKTOP_APP_POLICY ProcThreadAttributeValue(18, FALSE, TRUE, FALSE)
+#define PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_ENABLE_PROCESS_TREE 0x01
+#endif
+static std::wstring System32(const wchar_t* exe) {
+    wchar_t d[MAX_PATH];
+    GetSystemDirectoryW(d, MAX_PATH);
+    return std::wstring(d) + L"\\" + exe;
+}
+// Runs a command line hidden and waits; returns its exit code (0xFFFFFFFF if it didn't start).
+static DWORD RunHidden(std::wstring cmd, bool childrenBreakAway) {
+    STARTUPINFOEXW si{};
+    si.StartupInfo.cb = sizeof(si);
+    SIZE_T sz = 0;
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &sz);
+    std::vector<BYTE> buf(sz);
+    auto list = (LPPROC_THREAD_ATTRIBUTE_LIST)buf.data();
+    DWORD policy = PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_ENABLE_PROCESS_TREE;
+    bool attr = childrenBreakAway && InitializeProcThreadAttributeList(list, 1, 0, &sz);
+    if (attr && !UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_DESKTOP_APP_POLICY, &policy, sizeof(policy), nullptr, nullptr)) {
+        DeleteProcThreadAttributeList(list);
+        attr = false;
+    }
+    if (attr) si.lpAttributeList = list;
+    PROCESS_INFORMATION pi{};
+    BOOL ok = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW | (attr ? EXTENDED_STARTUPINFO_PRESENT : 0),
+                             nullptr, nullptr, &si.StartupInfo, &pi);
+    if (attr) DeleteProcThreadAttributeList(list);
+    if (!ok) return 0xFFFFFFFF;
+    DWORD code = 0xFFFFFFFF;
+    if (WaitForSingleObject(pi.hProcess, 30000) == WAIT_OBJECT_0) GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return code;
+}
+// cmd.exe (inside the package, breakaway policy) running reg.exe commands (outside it).
+static DWORD RunRegOutsidePackage(const std::wstring& regCommands) {
+    return RunHidden(L"\"" + System32(L"cmd.exe") + L"\" /d /c \"" + regCommands + L"\"", true);
+}
+static std::wstring RegExe() { return L"\"" + System32(L"reg.exe") + L"\""; }
+static std::wstring HexStr(const BYTE* p, size_t n) {
+    std::wstring s;
+    wchar_t b[4];
+    for (size_t i = 0; i < n; i++) { swprintf_s(b, L"%02x", p[i]); s += b; }
+    return s;
+}
+// Packaged reset: backup with "reg export", then "reg add" every default; returns RR_*.
+enum { RR_OK = 0, RR_BACKUP = 2, RR_WRITE = 3 };
+static int ResetMouseRegistryOutsidePackage(const std::wstring& bak, const wchar_t* regKey = L"HKCU\\Control Panel\\Mouse") {
+    const std::wstring key = L" \"" + std::wstring(regKey) + L"\"";
+    RunRegOutsidePackage(RegExe() + L" export" + key + L" \"" + bak + L"\" /y");
+    if (GetFileAttributesW(bak.c_str()) == INVALID_FILE_ATTRIBUTES) return RR_BACKUP;
+    std::wstring cmds;
+    auto add = [&](const std::wstring& name, const wchar_t* type, const std::wstring& data) {
+        if (!cmds.empty()) cmds += L" && ";
+        cmds += RegExe() + L" add" + key + L" /v " + name + L" /t " + type + L" /d \"" + data + L"\" /f";
+    };
+    for (auto& v : kMouseSz) add(v[0], L"REG_SZ", v[1]);
+    add(L"SmoothMouseXCurve", L"REG_BINARY", HexStr(kCurveX, sizeof(kCurveX)));
+    add(L"SmoothMouseYCurve", L"REG_BINARY", HexStr(kCurveY, sizeof(kCurveY)));
+    return RunRegOutsidePackage(cmds) == 0 ? RR_OK : RR_WRITE;
+}
 static void RegResetFlow() {
     int a = MessageBoxW(g_hwnd,
         L"Reset HKEY_CURRENT_USER\\Control Panel\\Mouse to Windows' default values?\n\n"
@@ -1436,9 +1507,25 @@ static void RegResetFlow() {
     if (a != IDOK) return;
     if (g_test) { g_regOk = true; g_regMsg = L"Test mode: nothing changed."; Redraw(); return; }
     std::wstring bak;
-    if (!BackupMouseKey(bak)) { g_regOk = false; g_regMsg = L"Couldn't save the backup, so nothing was changed."; Redraw(); return; }
+    if (g_packaged) {
+        // Documents, not AppData: a packaged app's new AppData files are redirected too, and
+        // reg.exe runs outside the package, so the backup must live where both see the same file.
+        wchar_t docs[MAX_PATH];
+        if (FAILED(SHGetFolderPathW(nullptr, CSIDL_PERSONAL, nullptr, 0, docs))) { g_regOk = false; g_regMsg = L"Couldn't find your Documents folder."; Redraw(); return; }
+        std::wstring dir = std::wstring(docs) + L"\\Vagii Mouse";
+        CreateDirectoryW(dir.c_str(), nullptr);
+        time_t t = time(nullptr); tm lt; localtime_s(&lt, &t);
+        wchar_t stamp[32]; wcsftime(stamp, 32, L"%Y%m%d-%H%M%S", &lt);
+        bak = dir + L"\\mouse-registry-backup-" + stamp + L".reg";
+        int r = ResetMouseRegistryOutsidePackage(bak);
+        if (r == RR_BACKUP) { g_regOk = false; g_regMsg = L"Couldn't save the backup, so nothing was changed."; Redraw(); return; }
+        g_regOk = r == RR_OK;
+        if (g_regOk) ApplyMouseDefaultsLive();
+    } else {
+        if (!BackupMouseKey(bak)) { g_regOk = false; g_regMsg = L"Couldn't save the backup, so nothing was changed."; Redraw(); return; }
+        g_regOk = ResetMouseRegistry();
+    }
     g_lastBackup = bak;
-    g_regOk = ResetMouseRegistry();
     g_regMsg = g_regOk ? L"Done. Backup saved; sign out to apply the curves." : L"Some values couldn't be written.";
     S.dev[DEV_MOUSE].level = 10;
     S.dev[DEV_MOUSE].accelMode = 1;
@@ -1618,6 +1705,23 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmd, int) {
     g_test = GetEnvironmentVariableW(L"VAGII_TEST", ev, 8) && ev[0] == L'1';
     g_packaged = IsPackaged();
     g_fakeStore = !g_packaged && GetEnvironmentVariableW(L"VAGII_FAKE_STORE", ev, 8) && ev[0] == L'1';
+    // tools\probe-msix.ps1: can reg.exe started from the package write the real HKCU?
+    // Only touches the throwaway key HKCU\Software\VagiiMsixProbe.
+    if (wcsstr(GetCommandLineW(), L"--probe-breakaway")) {
+        std::wstring k = L" HKCU\\Software\\VagiiMsixProbe";
+        RunHidden(RegExe() + L" add" + k + L" /v direct /d 1 /f", true);   // reg.exe as the direct child
+        RunRegOutsidePackage(RegExe() + L" add" + k + L" /v viacmd /d 1 /f");  // cmd.exe -> reg.exe
+        // the real reset commands, aimed at a throwaway key; arg = where to put the test backup
+        wchar_t* out = wcsstr(GetCommandLineW(), L"--probe-breakaway") + 17;
+        while (*out == L' ' || *out == L'"') out++;
+        std::wstring bak = out;
+        while (!bak.empty() && (bak.back() == L'"' || bak.back() == L' ')) bak.pop_back();
+        if (!bak.empty()) {
+            RunRegOutsidePackage(RegExe() + L" add HKCU\\Software\\VagiiMsixProbe\\Mouse /v Seed /d 1 /f");  // something to back up
+            return ResetMouseRegistryOutsidePackage(bak, L"HKCU\\Software\\VagiiMsixProbe\\Mouse");
+        }
+        return 0;
+    }
     const wchar_t* cls = g_test ? L"VagiiMouseWndTest" : L"VagiiMouseWnd";
     // Started by the updater: wait for the previous version to exit before taking over.
     if (const wchar_t* wp = wcsstr(cmd, L"--wait-pid=")) {
