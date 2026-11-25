@@ -56,6 +56,7 @@ struct Settings {
     int startup = 1;
     int closeToTray = 1;
     int autoUpdate = 1;
+    int keepActive = 0;  // nudge Windows' idle clock so idle-based timers don't stop
     int page = 0;
     long long lastCheck = 0;
 } S;
@@ -95,7 +96,7 @@ static void IniPath() {
     X(L"tpLevel", dev[1].level) X(L"tpAccelMode", dev[1].accelMode) X(L"tpAccelStrength", dev[1].accelStrength) \
     X(L"tpHaveOrig", dev[1].haveOrig) X(L"tpOrigSpeed", dev[1].origSpeed) \
     X(L"mouseDpi", mouseDpi) X(L"enabled", enabled) X(L"gameSafe", gameSafe) X(L"startup", startup) \
-    X(L"closeToTray", closeToTray) X(L"autoUpdate", autoUpdate) X(L"page", page)
+    X(L"closeToTray", closeToTray) X(L"autoUpdate", autoUpdate) X(L"keepActive", keepActive) X(L"page", page)
 
 static std::vector<int> ParseStages(const wchar_t* s) {
     std::vector<int> v;
@@ -779,7 +780,7 @@ static bool Click(int id, RF r, bool* hover = nullptr) {
 
 // ================================================================ app actions
 static const UINT WM_TRAY = WM_APP + 1, WM_SHOWME = WM_APP + 2;
-static const UINT TIMER_PERSIST = 1, TIMER_STATUS = 2, TIMER_AUTOCHECK = 3;
+static const UINT TIMER_PERSIST = 1, TIMER_STATUS = 2, TIMER_AUTOCHECK = 3, TIMER_KEEPACTIVE = 4;
 static UINT WM_TASKBARCREATED = 0;
 static HICON g_iconBig, g_iconSmall;
 static NOTIFYICONDATAW g_nid{};
@@ -833,6 +834,26 @@ static void RestoreOriginal(int dev) {
     Changed(false);
 }
 static void ToggleBoost() { S.enabled = !S.enabled; Changed(false); }
+
+// Keep active: when there has been no real input for KEEP_IDLE_MS, send a zero-distance mouse
+// move. It resets Windows' idle clock (what idle-based timers read) without moving the cursor.
+// The hook passes injected input through untouched.
+static DWORD g_keepIdleMs = 90 * 1000;
+static bool g_keepTest = false;  // VAGII_TEST + VAGII_KEEP_TEST=1: 5 s threshold, counts nudges in the INI
+static void KeepActiveTick() {
+    if (!S.keepActive || (g_test && !g_keepTest)) return;
+    LASTINPUTINFO li{sizeof(li)};
+    if (!GetLastInputInfo(&li) || GetTickCount() - li.dwTime < g_keepIdleMs) return;
+    INPUT in{};
+    in.type = INPUT_MOUSE;
+    in.mi.dwFlags = MOUSEEVENTF_MOVE;  // dx = dy = 0
+    UINT sent = SendInput(1, &in, sizeof(in));
+    if (g_keepTest && sent) {
+        int n = (int)GetPrivateProfileIntW(L"mouse", L"keepNudges", 0, g_ini) + 1;
+        WritePrivateProfileStringW(L"mouse", L"keepNudges", std::to_wstring(n).c_str(), g_ini);
+    }
+}
+static void ToggleKeepActive() { S.keepActive = !S.keepActive; SaveSettings(); Redraw(); }
 static bool DevLive(int dev) { long long t = g_lastMove[dev].load(); return t && MsSince(t) < 350; }
 
 // Ctrl+Alt+S: next stage of whichever device moved last.
@@ -1360,13 +1381,24 @@ static void DrawSettingsPage() {
         }  // !StoreMode()
     }
     {
-        RF r = R(RX, 312, RW, 104);
+        RF r = R(RX, 312, RW, 132);
         Fill(r, 14, C_CARD);
         Txt(L"SHORTCUTS", R(r.left + 18, r.top + 14, 200, 16), fLabel, C_DIM);
         Txt(L"Turn the boost on or off", R(r.left + 18, r.top + 38, 220, 20), fBody, C_TEXT);
         Txt(L"Ctrl+Alt+M", R(r.left, r.top + 38, RW - 18, 20), fBodyB, C_DIM, DWRITE_TEXT_ALIGNMENT_TRAILING);
         Txt(L"Next stage (last-used device)", R(r.left + 18, r.top + 66, 220, 20), fBody, C_TEXT);
         Txt(L"Ctrl+Alt+S", R(r.left, r.top + 66, RW - 18, 20), fBodyB, C_DIM, DWRITE_TEXT_ALIGNMENT_TRAILING);
+        Txt(L"Keep active on or off", R(r.left + 18, r.top + 94, 220, 20), fBody, C_TEXT);
+        Txt(L"Ctrl+Alt+K", R(r.left, r.top + 94, RW - 18, 20), fBodyB, C_DIM, DWRITE_TEXT_ALIGNMENT_TRAILING);
+    }
+    {
+        RF r = R(RX, 456, RW, 76);
+        Fill(r, 14, C_CARD);
+        Txt(L"Keep active", R(r.left + 18, r.top + 14, 220, 20), fBodyB, C_TEXT);
+        Txt(L"Stops idle timers from pausing you", R(r.left + 18, r.top + 36, RW - 100, 18), fSmall, C_DIM);
+        bool c;
+        Toggle(340, R(r.right - 62, r.top + 26, 44, 24), S.keepActive != 0, C_LIVE, &c);
+        if (c) ToggleKeepActive();
     }
 }
 
@@ -1558,9 +1590,12 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (!g_test) {
             RegisterHotKey(h, 1, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'M');
             RegisterHotKey(h, 2, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'S');
+            RegisterHotKey(h, 3, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'K');
+            SetTimer(h, TIMER_KEEPACTIVE, 15 * 1000, nullptr);
         }
         TrayAdd();
         SetTimer(h, TIMER_STATUS, 150, nullptr);
+        if (g_keepTest) { g_keepIdleMs = 5000; SetTimer(h, TIMER_KEEPACTIVE, 1000, nullptr); }
         if (!g_test && !StoreMode() && S.autoUpdate) SetTimer(h, TIMER_AUTOCHECK, 8000, nullptr);
         return 0;
     }
@@ -1610,9 +1645,11 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_HOTKEY:
         if (wp == 1) { ToggleBoost(); MessageBeep(S.enabled ? MB_OK : MB_ICONASTERISK); }
         else if (wp == 2) CycleStage();
+        else if (wp == 3) { ToggleKeepActive(); MessageBeep(S.keepActive ? MB_OK : MB_ICONASTERISK); }
         return 0;
     case WM_TIMER:
         if (wp == TIMER_PERSIST) { KillTimer(h, TIMER_PERSIST); ApplyAll(true); SaveSettings(); }
+        else if (wp == TIMER_KEEPACTIVE) KeepActiveTick();
         else if (wp == TIMER_STATUS && IsWindowVisible(h)) {
             static int lastSig = -1;
             int sig = (g_paused.load() ? 1 : 0) | (DevLive(0) ? 2 : 0) | (DevLive(1) ? 4 : 0);
@@ -1682,6 +1719,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (!g_test) Shell_NotifyIconW(NIM_DELETE, &g_nid);
         UnregisterHotKey(h, 1);
         UnregisterHotKey(h, 2);
+        UnregisterHotKey(h, 3);
         if (KillTimer(h, TIMER_PERSIST)) ApplyAll(true);
         SaveSettings();
         PostQuitMessage(0);
@@ -1703,6 +1741,7 @@ static void DarkMenus() {
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmd, int) {
     wchar_t ev[8] = L"";
     g_test = GetEnvironmentVariableW(L"VAGII_TEST", ev, 8) && ev[0] == L'1';
+    g_keepTest = g_test && GetEnvironmentVariableW(L"VAGII_KEEP_TEST", ev, 8) && ev[0] == L'1';
     g_packaged = IsPackaged();
     g_fakeStore = !g_packaged && GetEnvironmentVariableW(L"VAGII_FAKE_STORE", ev, 8) && ev[0] == L'1';
     // tools\probe-msix.ps1: can reg.exe started from the package write the real HKCU?
