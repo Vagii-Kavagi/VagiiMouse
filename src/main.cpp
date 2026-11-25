@@ -1388,14 +1388,13 @@ static void DrawSettingsPage() {
         Txt(L"Ctrl+Alt+M", R(r.left, r.top + 38, RW - 18, 20), fBodyB, C_DIM, DWRITE_TEXT_ALIGNMENT_TRAILING);
         Txt(L"Next stage (last-used device)", R(r.left + 18, r.top + 66, 220, 20), fBody, C_TEXT);
         Txt(L"Ctrl+Alt+S", R(r.left, r.top + 66, RW - 18, 20), fBodyB, C_DIM, DWRITE_TEXT_ALIGNMENT_TRAILING);
-        Txt(L"Keep active on or off", R(r.left + 18, r.top + 94, 220, 20), fBody, C_TEXT);
+        Txt(L"Keep Active on or off", R(r.left + 18, r.top + 94, 220, 20), fBody, C_TEXT);
         Txt(L"Ctrl+Alt+K", R(r.left, r.top + 94, RW - 18, 20), fBodyB, C_DIM, DWRITE_TEXT_ALIGNMENT_TRAILING);
     }
     {
         RF r = R(RX, 456, RW, 76);
         Fill(r, 14, C_CARD);
-        Txt(L"Keep active", R(r.left + 18, r.top + 14, 220, 20), fBodyB, C_TEXT);
-        Txt(L"Stops idle timers from pausing you", R(r.left + 18, r.top + 36, RW - 100, 18), fSmall, C_DIM);
+        Txt(L"Keep Active", R(r.left + 18, r.top + 28, 220, 20), fBodyB, C_TEXT);
         bool c;
         Toggle(340, R(r.right - 62, r.top + 26, 44, 24), S.keepActive != 0, C_LIVE, &c);
         if (c) ToggleKeepActive();
