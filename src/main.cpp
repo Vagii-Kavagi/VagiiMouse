@@ -782,11 +782,58 @@ static bool Click(int id, RF r, bool* hover = nullptr) {
 static const UINT WM_TRAY = WM_APP + 1, WM_SHOWME = WM_APP + 2;
 static const UINT TIMER_PERSIST = 1, TIMER_STATUS = 2, TIMER_AUTOCHECK = 3, TIMER_KEEPACTIVE = 4;
 static UINT WM_TASKBARCREATED = 0;
-static HICON g_iconBig, g_iconSmall;
+static HICON g_iconBig, g_iconSmall, g_iconDot;
 static NOTIFYICONDATAW g_nid{};
+
+// The tray icon with a small green dot in the bottom-right corner (Keep Active is on). Drawn
+// from the real icon's 32-bit pixels: a dark ring cut out of the glyph, then an antialiased dot.
+static HICON MakeDotIcon(HICON base) {
+    ICONINFO ii{};
+    if (!base || !GetIconInfo(base, &ii)) return nullptr;
+    BITMAP bm{};
+    GetObjectW(ii.hbmColor, sizeof(bm), &bm);
+    int w = bm.bmWidth, h = bm.bmHeight;
+    BITMAPINFO bi{};
+    bi.bmiHeader = {sizeof(BITMAPINFOHEADER), w, -h, 1, 32, BI_RGB};
+    std::vector<uint32_t> px((size_t)w * h);
+    HDC dc = GetDC(nullptr);
+    GetDIBits(dc, ii.hbmColor, 0, h, px.data(), &bi, DIB_RGB_COLORS);
+    DeleteObject(ii.hbmColor);
+    DeleteObject(ii.hbmMask);
+    const float r = w * 0.21f, ring = std::max(1.f, w * 0.07f);
+    const float cx = w - r - ring * 0.5f, cy = h - r - ring * 0.5f;
+    auto blend = [](uint32_t dst, uint32_t rgb, float a) {  // straight alpha, "over"
+        float da = (dst >> 24) / 255.f, oa = a + da * (1 - a);
+        if (oa <= 0) return 0u;
+        auto ch = [&](int s) { return (uint32_t)std::lround((((rgb >> s) & 255) * a + ((dst >> s) & 255) * da * (1 - a)) / oa); };
+        return ((uint32_t)std::lround(oa * 255) << 24) | (ch(16) << 16) | (ch(8) << 8) | ch(0);
+    };
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) {
+            float d = std::hypot(x + 0.5f - cx, y + 0.5f - cy);
+            uint32_t& p = px[(size_t)y * w + x];
+            float cut = std::clamp(r + ring + 0.5f - d, 0.f, 1.f);  // clear a gap around the dot
+            if (cut > 0) p = (p & 0x00FFFFFF) | ((uint32_t)std::lround(((p >> 24) & 255) * (1 - cut)) << 24);
+            float a = std::clamp(r + 0.5f - d, 0.f, 1.f);
+            if (a > 0) p = blend(p, 0x22C55E, a);  // C_LIVE green
+        }
+    void* bits = nullptr;
+    HBITMAP color = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    ReleaseDC(nullptr, dc);
+    if (!color) return nullptr;
+    memcpy(bits, px.data(), px.size() * 4);
+    std::vector<BYTE> zeros((size_t)((w + 15) / 16) * 2 * h, 0);
+    HBITMAP mask = CreateBitmap(w, h, 1, 1, zeros.data());  // alpha decides; mask all "opaque"
+    ICONINFO ni{TRUE, 0, 0, mask, color};
+    HICON ic = CreateIconIndirect(&ni);
+    DeleteObject(color);
+    DeleteObject(mask);
+    return ic;
+}
 
 static void Redraw() { if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE); }
 static void TrayTip() {
+    g_nid.hIcon = S.keepActive && g_iconDot ? g_iconDot : g_iconSmall;
     if (g_padPresent)
         swprintf_s(g_nid.szTip, L"Vagii Mouse - mouse %d, trackpad %d%s", S.dev[0].level, S.dev[1].level, S.enabled ? L"" : L" (boost off)");
     else
@@ -799,7 +846,6 @@ static void TrayAdd() {
     g_nid.uID = 1;
     g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_nid.uCallbackMessage = WM_TRAY;
-    g_nid.hIcon = g_iconSmall;
     TrayTip();
     Shell_NotifyIconW(NIM_ADD, &g_nid);
 }
@@ -853,7 +899,7 @@ static void KeepActiveTick() {
         WritePrivateProfileStringW(L"mouse", L"keepNudges", std::to_wstring(n).c_str(), g_ini);
     }
 }
-static void ToggleKeepActive() { S.keepActive = !S.keepActive; SaveSettings(); Redraw(); }
+static void ToggleKeepActive() { S.keepActive = !S.keepActive; SaveSettings(); TrayUpdate(); Redraw(); }
 static bool DevLive(int dev) { long long t = g_lastMove[dev].load(); return t && MsSince(t) < 350; }
 
 // Ctrl+Alt+S: next stage of whichever device moved last.
@@ -1806,6 +1852,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmd, int) {
 
     g_iconBig = (HICON)LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), 0);
     g_iconSmall = (HICON)LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0);
+    g_iconDot = MakeDotIcon(g_iconSmall);
     WM_TASKBARCREATED = RegisterWindowMessageW(L"TaskbarCreated");
 
     WNDCLASSEXW wc{sizeof(wc)};
@@ -1814,7 +1861,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmd, int) {
     wc.hInstance = inst;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     wc.hIcon = g_iconBig;
-    wc.hIconSm = g_iconSmall;
+    wc.hIconSm = g_test && S.keepActive && g_iconDot ? g_iconDot : g_iconSmall;  // test: preview the tray dot
     wc.lpszClassName = cls;
     RegisterClassExW(&wc);
 
